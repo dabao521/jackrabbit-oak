@@ -390,32 +390,7 @@ final class MongotIndex extends FulltextIndex {
 
         List<Document> pipeline = new ArrayList<>();
         boolean hasSearch = hasFullText || hasSimilarity || hasNativeQuery;
-        if (hasSearch) {
-            Document searchOperator;
-            List<String> highlightPaths = MongotResultAdapter.highlightPaths(
-                    request.excerptColumns());
-            List<Document> lexicalOperators = new ArrayList<>();
-            if (hasFullText) {
-                lexicalOperators.add(fullText.searchOperator());
-            }
-            if (hasNativeQuery) {
-                lexicalOperators.add(MongotNativeQueryString.operator(request.nativeQuery()));
-            }
-            Document lexicalOperator = combineMust(lexicalOperators);
-            if (hasSimilarity && similaritySeed.hasVector()) {
-                searchOperator = vectorSimilarityOperator(similaritySeed,
-                        lexicalOperator);
-                highlightPaths = List.of();
-            } else {
-                List<Document> operators = new ArrayList<>(lexicalOperators);
-                if (hasSimilarity) {
-                    operators.add(similarityOperator(similaritySeed.text()));
-                }
-                searchOperator = combineMust(operators);
-            }
-            pipeline.add(searchStage(definition, searchOperator, highlightPaths));
-        }
-        pipeline.addAll(filters.pipeline());
+        boolean vectorSearch = hasSimilarity && similaritySeed.hasVector();
 
         Document sort = new Document();
         Document requiredSortValues = new Document();
@@ -436,12 +411,54 @@ final class MongotIndex extends FulltextIndex {
                 requiredSortValues.append(field, new Document("$exists", true));
             }
         }
+
+        if (hasSearch) {
+            Document searchOperator;
+            List<String> highlightPaths = MongotResultAdapter.highlightPaths(
+                    request.excerptColumns());
+            List<Document> lexicalOperators = new ArrayList<>();
+            if (hasFullText) {
+                lexicalOperators.add(fullText.searchOperator());
+            }
+            if (hasNativeQuery) {
+                lexicalOperators.add(MongotNativeQueryString.operator(request.nativeQuery()));
+            }
+            Document lexicalOperator = combineMust(lexicalOperators);
+            if (vectorSearch) {
+                searchOperator = vectorSimilarityOperator(similaritySeed,
+                        lexicalOperator);
+                highlightPaths = List.of();
+            } else {
+                List<Document> operators = new ArrayList<>(lexicalOperators);
+                if (hasSimilarity) {
+                    operators.add(similarityOperator(similaritySeed.text()));
+                }
+                searchOperator = combineMust(operators);
+            }
+            if (!vectorSearch) {
+                searchOperator = applyCompoundFilter(searchOperator, filters,
+                        requiredSortValues);
+            }
+            pipeline.add(searchStage(definition, searchOperator, highlightPaths));
+        }
+        if (!hasSearch || vectorSearch) {
+            // No lexical $search operator to fold the filter clauses into
+            // ($searchVector rejects compound.filter): restore them as $match stages.
+            for (Document clause : MongotQueryTranslator.filterMatchClauses(filters)) {
+                pipeline.add(new Document("$match", clause));
+            }
+        }
+        pipeline.addAll(filters.pipeline());
+
         if (!sort.isEmpty()) {
-            // Oak's ordered indexes only expose rows that have a value for every
-            // sort key. MongoDB sorts documents with missing fields as null, so
-            // without this guard a sort-only plan would leak unrelated index
-            // documents into the result set.
-            pipeline.add(new Document("$match", requiredSortValues));
+            if (!hasSearch || vectorSearch) {
+                // Oak's ordered indexes only expose rows that have a value for every
+                // sort key. MongoDB sorts documents with missing fields as null, so
+                // without this guard a sort-only plan would leak unrelated index
+                // documents into the result set. When the pipeline starts with a
+                // lexical $search, the guard is folded into compound.filter above.
+                pipeline.add(new Document("$match", requiredSortValues));
+            }
             if (scoreMaterialized) {
                 pipeline.add(new Document("$set", new Document("_score",
                         new Document("$meta", "searchScore"))));
@@ -473,6 +490,47 @@ final class MongotIndex extends FulltextIndex {
             return operators.get(0);
         }
         return new Document("compound", new Document("must", operators));
+    }
+
+    /**
+     * Folds the translated filter clauses, plus the sort-guard {@code $exists}
+     * restrictions, into the search operator's {@code compound.filter} so mongot
+     * evaluates them index-side instead of mongod filtering matches after $search
+     * (the worst Atlas Search anti-pattern).
+     */
+    private static Document applyCompoundFilter(Document searchOperator,
+                                                MongotQueryTranslation filters,
+                                                Document requiredSortValues) {
+        List<Document> filterClauses = new ArrayList<>();
+        if (filters.searchOperator() != null) {
+            Document compound = filters.searchOperator().get("compound", Document.class);
+            List<Document> translated = compound == null
+                    ? null
+                    : compound.getList("filter", Document.class);
+            if (translated != null) {
+                filterClauses.addAll(translated);
+            }
+        }
+        if (!requiredSortValues.isEmpty()) {
+            // Oak's ordered indexes only expose rows that have a value for every
+            // sort key; the exists filter clause is exactly equivalent to the
+            // former {field: {$exists: true}} $match guard.
+            for (String field : requiredSortValues.keySet()) {
+                filterClauses.add(new Document("exists", new Document("path", field)));
+            }
+        }
+        if (filterClauses.isEmpty()) {
+            return searchOperator;
+        }
+        Document compound = searchOperator.get("compound", Document.class);
+        if (compound == null) {
+            return new Document("compound", new Document("must", List.of(searchOperator))
+                    .append("filter", filterClauses));
+        }
+        List<Document> existing = compound.getList("filter", Document.class);
+        List<Document> merged = new ArrayList<>(existing == null ? List.of() : existing);
+        merged.addAll(filterClauses);
+        return new Document("compound", new Document(compound).append("filter", merged));
     }
 
     private static Document similarityOperator(Document reference) {
@@ -590,6 +648,12 @@ final class MongotIndex extends FulltextIndex {
         if (!filters.isSupported()) {
             throw new IllegalStateException("Mongot virtual query became unsupported: "
                     + filters.reason());
+        }
+        // Virtual modes keep the filter clauses as residual $match stages: suggest /
+        // spellcheck result sets are small and operator-bounded, so the fold buys
+        // nothing and the residual stage avoids touching the virtual search operators.
+        for (Document clause : MongotQueryTranslator.filterMatchClauses(filters)) {
+            pipeline.add(new Document("$match", clause));
         }
         pipeline.addAll(filters.pipeline());
         pipeline.add(new Document("$project", projection));
