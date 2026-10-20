@@ -17,6 +17,7 @@
 package org.apache.jackrabbit.oak.plugins.index.mongot.query;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.LinkedHashMap;
@@ -181,9 +182,15 @@ public final class MongotQueryTranslator {
             return MongotQueryTranslation.supported(null, List.of());
         }
 
+        // Clauses mongot can evaluate index-side are returned as compound.filter
+        // clauses through searchOperator() so the caller can fold them into the
+        // $search operator instead of paying a $match stage after $search (the
+        // worst Atlas Search anti-pattern). Everything else stays a residual
+        // $match in pipeline().
+        List<Document> filterClauses = new ArrayList<>();
         List<Document> clauses = new ArrayList<>();
         Document pathClause = translatePath(filter.getPath(), filter.getPathRestriction(), planResult);
-        if (pathClause != null) {
+        if (pathClause != null && !asFilterClauses(pathClause, filterClauses)) {
             clauses.add(pathClause);
         }
 
@@ -208,27 +215,117 @@ public final class MongotQueryTranslator {
 
         if (!filter.matchesAllTypes()
                 && (planResult == null || planResult.evaluateNodeTypeRestriction())) {
-            List<Document> typeClauses = new ArrayList<>();
-            if (!filter.getPrimaryTypes().isEmpty()) {
-                typeClauses.add(new Document(MongoFieldNames.PRIMARY_TYPE,
-                        new Document("$in", new ArrayList<>(filter.getPrimaryTypes()))));
-            }
-            if (!filter.getMixinTypes().isEmpty()) {
-                typeClauses.add(new Document(MongoFieldNames.MIXIN_TYPES,
-                        new Document("$in", new ArrayList<>(filter.getMixinTypes()))));
-            }
-            if (typeClauses.size() == 1) {
-                clauses.add(typeClauses.get(0));
-            } else if (!typeClauses.isEmpty()) {
-                clauses.add(new Document("$or", typeClauses));
+            boolean hasPrimaryTypes = !filter.getPrimaryTypes().isEmpty();
+            boolean hasMixinTypes = !filter.getMixinTypes().isEmpty();
+            if (hasPrimaryTypes && hasMixinTypes) {
+                // compound.filter clauses are only AND-combined, so the OR between
+                // primary and mixin types must stay a residual $match.
+                clauses.add(new Document("$or", List.of(
+                        new Document(MongoFieldNames.PRIMARY_TYPE,
+                                new Document("$in", new ArrayList<>(filter.getPrimaryTypes()))),
+                        new Document(MongoFieldNames.MIXIN_TYPES,
+                                new Document("$in", new ArrayList<>(filter.getMixinTypes()))))));
+            } else if (hasPrimaryTypes) {
+                filterClauses.add(inClause(MongoFieldNames.PRIMARY_TYPE, filter.getPrimaryTypes()));
+            } else if (hasMixinTypes) {
+                filterClauses.add(inClause(MongoFieldNames.MIXIN_TYPES, filter.getMixinTypes()));
             }
         }
 
-        if (clauses.isEmpty()) {
+        if (filterClauses.isEmpty() && clauses.isEmpty()) {
             return MongotQueryTranslation.supported(null, List.of());
         }
-        Document match = clauses.size() == 1 ? clauses.get(0) : new Document("$and", clauses);
-        return MongotQueryTranslation.supported(null, List.of(new Document("$match", match)));
+        List<Document> pipeline = clauses.isEmpty() ? List.of()
+                : List.of(new Document("$match", clauses.size() == 1
+                        ? clauses.get(0) : new Document("$and", clauses)));
+        if (filterClauses.isEmpty()) {
+            return MongotQueryTranslation.supported(null, pipeline);
+        }
+        return MongotQueryTranslation.supported(
+                new Document("compound", new Document("filter", filterClauses)), pipeline);
+    }
+
+    /**
+     * Converts a plain-equality $match clause (or an $and of plain equalities) into
+     * compound.filter equals clauses, appending them to {@code filterClauses}. Returns
+     * {@code false} when the clause is not a plain equality, in which case the caller
+     * must keep it a residual $match.
+     */
+    private static boolean asFilterClauses(Document matchClause, List<Document> filterClauses) {
+        if (matchClause.containsKey("$and")) {
+            List<Document> children = matchClause.getList("$and", Document.class);
+            if (children == null) {
+                return false;
+            }
+            List<Document> converted = new ArrayList<>();
+            for (Document child : children) {
+                if (!asFilterClauses(child, converted)) {
+                    return false;
+                }
+            }
+            filterClauses.addAll(converted);
+            return true;
+        }
+        if (matchClause.size() != 1) {
+            return false;
+        }
+        String field = matchClause.keySet().iterator().next();
+        Object value = matchClause.get(field);
+        if (value instanceof Document) {
+            return false;
+        }
+        filterClauses.add(equalsClause(field, value));
+        return true;
+    }
+
+    private static Document equalsClause(String field, Object value) {
+        return new Document("equals", new Document("path", field).append("value", value));
+    }
+
+    private static Document inClause(String field, Collection<String> values) {
+        return new Document("in", new Document("path", field)
+                .append("value", new ArrayList<>(values)));
+    }
+
+    /**
+     * Restores the $match clauses for the compound filter operator built by
+     * {@link #translateFilter}, for callers whose pipeline has no $search stage (or a
+     * {@code $searchVector} operator) to fold the clauses into.
+     */
+    public static List<Document> filterMatchClauses(MongotQueryTranslation filters) {
+        Document filterOperator = filters.searchOperator();
+        if (filterOperator == null) {
+            return List.of();
+        }
+        Document compound = filterOperator.get("compound", Document.class);
+        List<Document> filterClauses = compound == null
+                ? null
+                : compound.getList("filter", Document.class);
+        if (filterClauses == null) {
+            throw new IllegalArgumentException(
+                    "not a compound filter operator: " + filterOperator);
+        }
+        List<Document> clauses = new ArrayList<>();
+        for (Document clause : filterClauses) {
+            Document body = clause.get("equals", Document.class);
+            if (body != null) {
+                clauses.add(new Document(body.getString("path"), body.get("value")));
+                continue;
+            }
+            body = clause.get("in", Document.class);
+            if (body != null) {
+                clauses.add(new Document(body.getString("path"),
+                        new Document("$in", body.getList("value", Object.class))));
+                continue;
+            }
+            body = clause.get("exists", Document.class);
+            if (body != null) {
+                clauses.add(new Document(body.getString("path"), new Document("$exists", true)));
+                continue;
+            }
+            throw new IllegalArgumentException("unsupported filter clause: " + clause);
+        }
+        return clauses;
     }
 
     private static MongotQueryTranslation translate(FullTextExpression expression,

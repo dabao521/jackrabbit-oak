@@ -508,6 +508,26 @@ public class MongotSearchIndexDefinitionBuilderTest {
                 fields.get(fieldName, Document.class));
     }
 
+    @Test
+    public void mapsStructuralMetadataForCompoundFilterPushdown() {
+        Document fields = MongotSearchIndexDefinitionBuilder.build(definition(builder()))
+                .get("mappings", Document.class).get("fields", Document.class);
+
+        // The connector pushes path, depth and node-type restrictions into
+        // $search.compound.filter equals / in / exists clauses, which mongot only
+        // evaluates exactly on token (strings) and number fields.
+        assertEquals("token", fieldType(fields, MongoFieldNames.PATH));
+        assertEquals("token", fieldType(fields, MongoFieldNames.PARENT));
+        assertEquals("token", fieldType(fields, MongoFieldNames.ANCESTORS));
+        assertEquals("number", fieldType(fields, MongoFieldNames.DEPTH));
+        assertEquals("token", fieldType(fields, MongoFieldNames.PRIMARY_TYPE));
+        assertEquals("token", fieldType(fields, MongoFieldNames.MIXIN_TYPES));
+    }
+
+    private static String fieldType(Document fields, String fieldName) {
+        return fields.get(fieldName, Document.class).getString("type");
+    }
+
     private static IndexDefinitionBuilder builder() {
         return new IndexDefinitionBuilder() {
             @Override
