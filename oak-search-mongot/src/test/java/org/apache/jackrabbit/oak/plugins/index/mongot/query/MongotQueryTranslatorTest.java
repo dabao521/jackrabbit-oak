@@ -18,9 +18,11 @@ package org.apache.jackrabbit.oak.plugins.index.mongot.query;
 
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 
 import javax.jcr.PropertyType;
 
+import org.apache.jackrabbit.oak.commons.PathUtils;
 import org.apache.jackrabbit.oak.plugins.index.IndexConstants;
 import org.apache.jackrabbit.oak.plugins.index.mongot.MongotIndexDefinition;
 import org.apache.jackrabbit.oak.plugins.index.mongot.index.MongoFieldNames;
@@ -364,13 +366,137 @@ public class MongotQueryTranslatorTest {
         children.restrictPath("/content", Filter.PathRestriction.DIRECT_CHILDREN);
         FilterImpl descendants = FilterImpl.newTestInstance();
         descendants.restrictPath("/content", Filter.PathRestriction.ALL_CHILDREN);
+        FilterImpl parent = FilterImpl.newTestInstance();
+        parent.restrictPath("/content/a", Filter.PathRestriction.PARENT);
 
-        assertEquals(List.of(new Document("$match", new Document(MongoFieldNames.PATH, "/content/a"))),
-                MongotQueryTranslator.translateFilter(exact).pipeline());
-        assertEquals(List.of(new Document("$match", new Document(MongoFieldNames.PARENT, "/content"))),
-                MongotQueryTranslator.translateFilter(children).pipeline());
-        assertEquals(List.of(new Document("$match", new Document(MongoFieldNames.ANCESTORS, "/content"))),
-                MongotQueryTranslator.translateFilter(descendants).pipeline());
+        assertEquals(compoundFilter(new Document("equals",
+                        new Document("path", MongoFieldNames.PATH).append("value", "/content/a"))),
+                MongotQueryTranslator.translateFilter(exact).searchOperator());
+        assertEquals(compoundFilter(new Document("equals",
+                        new Document("path", MongoFieldNames.PARENT).append("value", "/content"))),
+                MongotQueryTranslator.translateFilter(children).searchOperator());
+        assertEquals(compoundFilter(new Document("equals",
+                        new Document("path", MongoFieldNames.ANCESTORS).append("value", "/content"))),
+                MongotQueryTranslator.translateFilter(descendants).searchOperator());
+        assertEquals(compoundFilter(new Document("equals",
+                        new Document("path", MongoFieldNames.PATH)
+                                .append("value", PathUtils.getParentPath("/content/a")))),
+                MongotQueryTranslator.translateFilter(parent).searchOperator());
+        assertEquals(List.of(), MongotQueryTranslator.translateFilter(exact).pipeline());
+        assertEquals(List.of(), MongotQueryTranslator.translateFilter(children).pipeline());
+        assertEquals(List.of(), MongotQueryTranslator.translateFilter(descendants).pipeline());
+    }
+
+    @Test
+    public void translatesTransformedDirectChildrenToEqualsClauses() {
+        FilterImpl filter = FilterImpl.newTestInstance();
+        filter.restrictPath("/content", Filter.PathRestriction.DIRECT_CHILDREN);
+
+        PlanResult planResult = mock(PlanResult.class);
+        when(planResult.evaluateNonFullTextConstraints()).thenReturn(true);
+        when(planResult.isPathTransformed()).thenReturn(true);
+        when(planResult.getParentPathSegment()).thenReturn(null);
+        when(planResult.getParentDepth()).thenReturn(2);
+
+        assertEquals(compoundFilter(
+                new Document("equals", new Document("path", MongoFieldNames.ANCESTORS)
+                        .append("value", "/content")),
+                new Document("equals", new Document("path", MongoFieldNames.DEPTH)
+                        .append("value", 4))),
+                MongotQueryTranslator.translateFilter(filter, planResult).searchOperator());
+        assertEquals(List.of(),
+                MongotQueryTranslator.translateFilter(filter, planResult).pipeline());
+    }
+
+    @Test
+    public void pushesSingleNodeTypeRestrictionIntoCompoundFilter() {
+        Filter filter = mock(Filter.class);
+        when(filter.getPathRestriction()).thenReturn(Filter.PathRestriction.NO_RESTRICTION);
+        when(filter.getPropertyRestrictions()).thenReturn(List.of());
+        when(filter.matchesAllTypes()).thenReturn(false);
+        when(filter.getPrimaryTypes()).thenReturn(Set.of("nt:unstructured"));
+        when(filter.getMixinTypes()).thenReturn(Set.of());
+
+        assertEquals(compoundFilter(new Document("in",
+                        new Document("path", MongoFieldNames.PRIMARY_TYPE)
+                                .append("value", List.of("nt:unstructured")))),
+                MongotQueryTranslator.translateFilter(filter).searchOperator());
+        assertEquals(List.of(), MongotQueryTranslator.translateFilter(filter).pipeline());
+    }
+
+    @Test
+    public void keepsPrimaryAndMixinOrCombinationAsResidualMatch() {
+        Filter filter = mock(Filter.class);
+        when(filter.getPathRestriction()).thenReturn(Filter.PathRestriction.NO_RESTRICTION);
+        when(filter.getPropertyRestrictions()).thenReturn(List.of());
+        when(filter.matchesAllTypes()).thenReturn(false);
+        when(filter.getPrimaryTypes()).thenReturn(Set.of("nt:unstructured"));
+        when(filter.getMixinTypes()).thenReturn(Set.of("mix:title"));
+
+        assertEquals(null, MongotQueryTranslator.translateFilter(filter).searchOperator());
+        assertEquals(List.of(new Document("$match", new Document("$or", List.of(
+                        new Document(MongoFieldNames.PRIMARY_TYPE,
+                                new Document("$in", List.of("nt:unstructured"))),
+                        new Document(MongoFieldNames.MIXIN_TYPES,
+                                new Document("$in", List.of("mix:title"))))))),
+                MongotQueryTranslator.translateFilter(filter).pipeline());
+    }
+
+    @Test
+    public void keepsPropertyRestrictionsAsResidualMatch() {
+        FilterImpl filter = FilterImpl.newTestInstance();
+        filter.restrictPath("/content", Filter.PathRestriction.ALL_CHILDREN);
+        filter.restrictProperty("status", Operator.EQUAL, PropertyValues.newString("published"));
+
+        assertEquals(compoundFilter(new Document("equals",
+                        new Document("path", MongoFieldNames.ANCESTORS).append("value", "/content"))),
+                MongotQueryTranslator.translateFilter(filter).searchOperator());
+        assertEquals(List.of(new Document("$match", new Document(
+                        "typed." + MongoFieldNames.encodeProperty("status"), "published"))),
+                MongotQueryTranslator.translateFilter(filter).pipeline());
+    }
+
+    @Test
+    public void pushesPathAndNodeTypeRestrictionsTogetherIntoCompoundFilter() {
+        Filter filter = mock(Filter.class);
+        when(filter.getPath()).thenReturn("/content/dam");
+        when(filter.getPathRestriction()).thenReturn(Filter.PathRestriction.ALL_CHILDREN);
+        when(filter.getPropertyRestrictions()).thenReturn(List.of());
+        when(filter.matchesAllTypes()).thenReturn(false);
+        when(filter.getPrimaryTypes()).thenReturn(Set.of("dam:Asset"));
+        when(filter.getMixinTypes()).thenReturn(Set.of());
+
+        assertEquals(compoundFilter(
+                new Document("equals", new Document("path", MongoFieldNames.ANCESTORS)
+                        .append("value", "/content/dam")),
+                new Document("in", new Document("path", MongoFieldNames.PRIMARY_TYPE)
+                        .append("value", List.of("dam:Asset")))),
+                MongotQueryTranslator.translateFilter(filter).searchOperator());
+        assertEquals(List.of(), MongotQueryTranslator.translateFilter(filter).pipeline());
+    }
+
+    @Test
+    public void restoresMatchClausesFromCompoundFilter() {
+        Document filterOperator = compoundFilter(
+                new Document("equals", new Document("path", MongoFieldNames.PATH)
+                        .append("value", "/content/a")),
+                new Document("in", new Document("path", MongoFieldNames.PRIMARY_TYPE)
+                        .append("value", List.of("nt:unstructured"))),
+                new Document("exists", new Document("path", "typed.abc")));
+
+        assertEquals(List.of(
+                new Document(MongoFieldNames.PATH, "/content/a"),
+                new Document(MongoFieldNames.PRIMARY_TYPE,
+                        new Document("$in", List.of("nt:unstructured"))),
+                new Document("typed.abc", new Document("$exists", true))),
+                MongotQueryTranslator.filterMatchClauses(
+                        MongotQueryTranslation.supported(filterOperator, List.of())));
+        assertEquals(List.of(), MongotQueryTranslator.filterMatchClauses(
+                MongotQueryTranslation.supported(null, List.of())));
+    }
+
+    private static Document compoundFilter(Document... clauses) {
+        return new Document("compound", new Document("filter", List.of(clauses)));
     }
 
     @Test
