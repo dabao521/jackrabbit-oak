@@ -71,6 +71,16 @@ final class MongotSearchIndexDefinitionBuilder {
     static Document build(MongotIndexDefinition definition) {
         Analyzer analyzer = analyzer(definition.getDefinitionNodeState());
         Document fields = new Document();
+        // Structural metadata the connector matches with compound.filter equals / in /
+        // exists clauses. Dynamic mapping already types these strings as token, but they
+        // are pinned explicitly so filter semantics stay exact and analyzer-independent
+        // regardless of the dynamic-mapping defaults.
+        fields.append(MongoFieldNames.PATH, new Document("type", "token"));
+        fields.append(MongoFieldNames.PARENT, new Document("type", "token"));
+        fields.append(MongoFieldNames.ANCESTORS, new Document("type", "token"));
+        fields.append(MongoFieldNames.DEPTH, new Document("type", "number"));
+        fields.append(MongoFieldNames.PRIMARY_TYPE, new Document("type", "token"));
+        fields.append(MongoFieldNames.MIXIN_TYPES, new Document("type", "token"));
         fields.append(MongoFieldNames.SYNC_TOKEN, new Document("type", "token"));
         if (definition.isSuggestEnabled()) {
             Document autocomplete = new Document("type", "autocomplete")
