@@ -537,8 +537,10 @@ final class MongotIndex extends FulltextIndex {
      * restrictions, into the search operator's {@code compound.filter} so mongot
      * evaluates them index-side instead of mongod filtering matches after $search
      * (the worst Atlas Search anti-pattern).
+     *
+     * <p>Package-private for unit tests asserting the fold.
      */
-    private static Document applyCompoundFilter(Document searchOperator,
+    static Document applyCompoundFilter(Document searchOperator,
                                                 MongotQueryTranslation filters,
                                                 Document requiredSortValues) {
         List<Document> filterClauses = new ArrayList<>();
